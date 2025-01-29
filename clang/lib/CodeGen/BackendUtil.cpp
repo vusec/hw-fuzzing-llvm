@@ -696,6 +696,24 @@ static void addSanitizers(const Triple &TargetTriple,
 
     if (LangOpts.Sanitize.has(SanitizerKind::DataFlow)) {
       MPM.addPass(DataFlowSanitizerPass(LangOpts.NoSanitizeFiles));
+
+// PHANTOM_TRAILS
+      if (Level != OptimizationLevel::O0) {
+        FunctionPassManager FPM = PB.buildFunctionSimplificationPipeline(Level,
+                                                                         ThinOrFullLTOPhase::FullLTOPreLink);
+        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+      }
+// END PHANTOM_TRAILS
+    }
+
+    if (LangOpts.Sanitize.has(SanitizerKind::Memory)) {
+// PHANTOM_TRAILS
+      if (Level != OptimizationLevel::O0) {
+        FunctionPassManager FPM = PB.buildFunctionSimplificationPipeline(Level,
+                                                                         ThinOrFullLTOPhase::FullLTOPreLink);
+        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+      }
+// END
     }
   });
 }

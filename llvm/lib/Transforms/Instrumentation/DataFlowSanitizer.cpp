@@ -1541,7 +1541,9 @@ bool DataFlowSanitizer::runImpl(Module &M) {
         // DFSanVisitor may delete Inst, so keep track of whether it was a
         // terminator.
         bool IsTerminator = Inst->isTerminator();
-        if (!DFSF.SkipInsts.count(Inst))
+
+        if (!DFSF.SkipInsts.count(Inst) &&
+            !Inst->hasMetadata(LLVMContext::MD_nosanitize))
           DFSanVisitor(DFSF).visit(Inst);
         if (IsTerminator)
           break;

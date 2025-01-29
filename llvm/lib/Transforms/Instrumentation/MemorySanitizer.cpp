@@ -227,7 +227,7 @@ static cl::opt<bool> ClKeepGoing("msan-keep-going",
 
 static cl::opt<bool> ClPoisonStack("msan-poison-stack",
        cl::desc("poison uninitialized stack variables"),
-       cl::Hidden, cl::init(true));
+       cl::Hidden, cl::init(false));
 
 static cl::opt<bool> ClPoisonStackWithCall("msan-poison-stack-with-call",
        cl::desc("poison uninitialized stack variables with a call"),
@@ -239,7 +239,7 @@ static cl::opt<int> ClPoisonStackPattern("msan-poison-stack-pattern",
 
 static cl::opt<bool> ClPoisonUndef("msan-poison-undef",
        cl::desc("poison undef temps"),
-       cl::Hidden, cl::init(true));
+       cl::Hidden, cl::init(false));
 
 static cl::opt<bool> ClHandleICmp("msan-handle-icmp",
        cl::desc("propagate shadow through ICmpEQ and ICmpNE"),
@@ -279,7 +279,7 @@ static cl::opt<bool> ClHandleAsmConservative(
 // be zeroed. As of 2012-08-28 this flag adds 20% slowdown.
 static cl::opt<bool> ClCheckAccessAddress("msan-check-access-address",
        cl::desc("report accesses through a pointer which has poisoned shadow"),
-       cl::Hidden, cl::init(true));
+       cl::Hidden, cl::init(false));
 
 static cl::opt<bool> ClEagerChecks(
     "msan-eager-checks",
@@ -650,10 +650,10 @@ template <class T> T getOptOrDefault(const cl::opt<T> &Opt, T Default) {
 
 MemorySanitizerOptions::MemorySanitizerOptions(int TO, bool R, bool K,
                                                bool EagerChecks)
-    : Kernel(getOptOrDefault(ClEnableKmsan, K)),
-      TrackOrigins(getOptOrDefault(ClTrackOrigins, Kernel ? 2 : TO)),
-      Recover(getOptOrDefault(ClKeepGoing, Kernel || R)),
-      EagerChecks(getOptOrDefault(ClEagerChecks, EagerChecks)) {}
+    : Kernel(false), // BFSAN: Overwrite defaults.
+      TrackOrigins(false),
+      Recover(true),
+      EagerChecks(false) {}
 
 PreservedAnalyses MemorySanitizerPass::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
@@ -1208,6 +1208,8 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
 
   /// Helper function to insert a warning at IRB's current insert point.
   void insertWarningFn(IRBuilder<> &IRB, Value *Origin) {
+    return; // BFSAN: Ignore taint checks.
+
     if (!Origin)
       Origin = (Value *)IRB.getInt32(0);
     assert(Origin->getType()->isIntegerTy());
@@ -1791,6 +1793,8 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
   /// This location will be later instrumented with a check that will print a
   /// UMR warning in runtime if the value is not fully defined.
   void insertShadowCheck(Value *Val, Instruction *OrigIns) {
+    return; // BFSAN: Disable checks
+
     assert(Val);
     Value *Shadow, *Origin;
     if (ClCheckConstantShadow) {
@@ -2323,37 +2327,8 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
   /// Sometimes the comparison result is known even if some of the bits of the
   /// arguments are not.
   void handleEqualityComparison(ICmpInst &I) {
-    IRBuilder<> IRB(&I);
-    Value *A = I.getOperand(0);
-    Value *B = I.getOperand(1);
-    Value *Sa = getShadow(A);
-    Value *Sb = getShadow(B);
-
-    // Get rid of pointers and vectors of pointers.
-    // For ints (and vectors of ints), types of A and Sa match,
-    // and this is a no-op.
-    A = IRB.CreatePointerCast(A, Sa->getType());
-    B = IRB.CreatePointerCast(B, Sb->getType());
-
-    // A == B  <==>  (C = A^B) == 0
-    // A != B  <==>  (C = A^B) != 0
-    // Sc = Sa | Sb
-    Value *C = IRB.CreateXor(A, B);
-    Value *Sc = IRB.CreateOr(Sa, Sb);
-    // Now dealing with i = (C == 0) comparison (or C != 0, does not matter now)
-    // Result is defined if one of the following is true
-    // * there is a defined 1 bit in C
-    // * C is fully defined
-    // Si = !(C & ~Sc) && Sc
-    Value *Zero = Constant::getNullValue(Sc->getType());
-    Value *MinusOne = Constant::getAllOnesValue(Sc->getType());
-    Value *Si =
-      IRB.CreateAnd(IRB.CreateICmpNE(Sc, Zero),
-                    IRB.CreateICmpEQ(
-                      IRB.CreateAnd(IRB.CreateXor(Sc, MinusOne), C), Zero));
-    Si->setName("_msprop_icmp");
-    setShadow(&I, Si);
-    setOriginForNaryOp(I);
+    setShadow(&I, getCleanShadow(&I));
+    setOrigin(&I, getCleanOrigin());
   }
 
   /// Build the lowest possible value of V, taking into account V's
@@ -3970,7 +3945,7 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
       Sa1 = IRB.CreateOr({IRB.CreateXor(C, D), Sc, Sd});
     }
     Value *Sa = IRB.CreateSelect(Sb, Sa1, Sa0, "_msprop_select");
-    setShadow(&I, Sa);
+    setShadow(&I, Sa0); // BFSAN: Avoid checking condition taint.
     if (MS.TrackOrigins) {
       // Origins are always i32, so any vector conditions must be flattened.
       // FIXME: consider tracking vector origins for app vectors?
@@ -4008,7 +3983,8 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
   }
 
   void visitGetElementPtrInst(GetElementPtrInst &I) {
-    handleShadowOr(I);
+    setShadow(&I, getCleanShadow(&I));
+    setOrigin(&I, getCleanOrigin());
   }
 
   void visitExtractValueInst(ExtractValueInst &I) {
