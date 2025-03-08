@@ -412,9 +412,9 @@ static const MemoryMapParams Linux_S390X_MemoryMapParams = {
 // aarch64 Linux
 static const MemoryMapParams Linux_AArch64_MemoryMapParams = {
   0,               // AndMask (not used)
-  0x06000000000,   // XorMask
+  0x0B00000000000, // XorMask
   0,               // ShadowBase (not used)
-  0x01000000000,   // OriginBase
+  0x0200000000000, // OriginBase
 };
 
 // aarch64 FreeBSD
