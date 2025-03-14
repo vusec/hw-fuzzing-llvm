@@ -38,6 +38,11 @@ public:
     }
     return false;
   }
+
+  __attribute__((no_sanitize("memory", "dataflow")))
+  static void checkRange(void *checkPtr, void *outPtr, unsigned size) {
+    memcpy(outPtr, toShadowAddr(checkPtr), size);
+  }
 };
 
 #endif // TAINTING_H
