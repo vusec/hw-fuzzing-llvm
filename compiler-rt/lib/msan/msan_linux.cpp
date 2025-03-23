@@ -155,7 +155,7 @@ static bool InitShadow(bool init_origins, bool dry_run) {
       if (!dry_run &&
           !MmapFixedSuperNoReserve(start, size, kMemoryLayout[i].name))
         return false;
-      if (dry_run && common_flags()->use_madv_dontdump)
+      if (!dry_run && common_flags()->use_madv_dontdump)
         DontDumpShadowMemory(start, size);
     }
     if (protect) {
