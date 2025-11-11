@@ -1838,8 +1838,45 @@ Value *DFSanFunction::combineShadows(Value *V1, Value *V2, Instruction *Pos) {
 // of the provided instruction Inst, inserting the IR before Inst.  Returns
 // the computed union Value.
 Value *DFSanFunction::combineOperandShadows(Instruction *Inst) {
-  if (Inst->getNumOperands() == 0)
+  if (Inst->getNumOperands() == 0) {
     return DFS.getZeroShadow(Inst);
+  }
+
+  // the choice to move this here instead of placing it in combineShadows
+  // is because i am not sure if the Pos parameter is always at the
+  // instruction being instrumented.
+  IRBuilder<> IRB(Inst);
+  if (auto *BO = dyn_cast<BinaryOperator>(Inst)) {
+    // the bug was due to here we are not checking if it is scalar
+    // this previously captures also vector type but applies treatment
+    // for scalars and this could be verified by
+    // /home/ruida/code/phantom-trails-private/llvm/_build/bin/opt -dfsan -S 
+    // -disable-output /home/ruida/code/phantom-trails-private/llvm/llvm/test/Instrumentation/DataFlowSanitizer/vector.ll
+    if (BO->getOpcode() == Instruction::And && BO->getType()->isIntegerTy()) {
+      Value *Op1 = BO->getOperand(0);
+      Value *Op2 = BO->getOperand(1);
+      Value *PV1 = collapseToPrimitiveShadow(getShadow(Op1), Inst);
+      Value *PV2 = collapseToPrimitiveShadow(getShadow(Op2), Inst);
+
+      if (PV1->getType() != PV2->getType())
+        PV2 = IRB.CreateZExtOrTrunc(PV2, PV1->getType());
+      
+      Value *Op2isZero  = IRB.CreateICmpEQ(Op2, ConstantInt::get(Op2->getType(), 0));
+      Value *PV2isZero  = IRB.CreateICmpEQ(PV2, ConstantInt::get(PV2->getType(), 0));
+      // Sign ext the 1-bit mask
+      // NOT ZEXT 
+      Value *Mask1      = IRB.CreateSExt(IRB.CreateNot(IRB.CreateAnd(Op2isZero, PV2isZero)), PV1->getType());
+      
+      Value *PV1_new    = IRB.CreateAnd(PV1, Mask1);
+      Value *Op1isZero  = IRB.CreateICmpEQ(Op1, ConstantInt::get(Op1->getType(), 0));
+      Value *PV1isZero  = IRB.CreateICmpEQ(PV1, ConstantInt::get(PV1->getType(), 0));
+      Value *Mask2      = IRB.CreateSExt(IRB.CreateNot(IRB.CreateAnd(Op1isZero, PV1isZero)), PV2->getType());
+      
+      Value *PV2_new    = IRB.CreateAnd(PV2, Mask2);
+      Value *Result = IRB.CreateOr(PV1_new, PV2_new);
+      return expandFromPrimitiveShadow(Inst->getType(), Result, Inst);
+    }
+  }
 
   Value *Shadow = getShadow(Inst->getOperand(0));
   for (unsigned I = 1, N = Inst->getNumOperands(); I < N; ++I)
