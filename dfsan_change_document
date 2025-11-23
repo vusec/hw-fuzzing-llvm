@@ -1,0 +1,95 @@
+Call chain in original DFSan:
+VisitLoadInst
+   -...->  loadShadowFast 
+            - AND all shadow byte, returns 1 byte taint
+   -...->  expandFromPrimitiveShadow
+            - ...-> getShadowTy (returns 1 byte for all scalars/vectors)
+            - only for struct & array, splat/expand taint to shadow members
+            - originally does nothing for anything else than struct/array
+   After all these the taint is put into ValShadowMap.
+CombineShadows
+   -...->  collapseToPrimitiveShadow
+            - only for struct & array, collapse member taints to 8 byte
+            - originally does nothing for anything else than struct/array
+   After that the taints are OR'd and stored
+VisitStoreInst
+   -...-> collapseToPrimitiveShadow (only in old version)
+            - only for struct & array, collapse member taints to 8 byte
+   It tries to collapse the taint regardless.
+   -...-> storePrimitiveShadowOrigin
+            - it expand/splats the collapsed taint to all shadow bytes
+
+
+To some extent, the shadow from and into loadShadowFast/storePrimitiveShadowOrigin
+are amorphous (1byte PrimitiveShadow, no aware of memory layout/data type).
+It is expandFromPrimitiveShadow that transforms it into the correct shape.
+The inverse collapseToPrimitiveShadow put it back to the 1byte form.
+
+What we want: tldr; 
+1. wide scalar shadow to exist from loadShadowFast until storePrimitiveShadowOrigin
+2. expand and collapse are able to act on wide shadow for scalar ints correctly
+3. dont let expand and collapse be called on scalar shadows as it used to be
+
+1. Scalar Integers
+Shadow: Same width as the data (e.g., i64 has i64 shadow), at least 1 byte
+Load: Put wide shadow into shadow ValShadowMap
+CombineShadows: For non-byte-precise operations, wide shadow is collapsed and
+OR'd (legacy path)
+Byte-Precise Path: only for certain scalar ops, does not call CombineShadows
+Store: Store the wide shadow as-is
+
+2. Struct / Array
+Shadow: shadow struct/array with elements that could be wide
+Load: FastLoad loads collapsed shadow, 
+      later expandFromPrimitiveShadowRecursive would expand the collapsed shadow
+      to all wide element shadows
+CombineShadows: ?
+Store: Collapse into 1 byte shadow and splat that for all shadow bytes
+
+3. Vector
+Shadow: Folded 1 byte shadow
+Load: (Not sure) FastLoad loads collapsed shadow, later the 1 byte shadow is put
+      into ValShadowMap
+Store: splat the 1 byte shadow for all shadow bytes
+Start by returning wide shadow for scalar int.
+
+
+Detailed Lifecycle:
+
+In loadShadowFast, if we are loading a scalar int larger or eq to i8, do the
+early return with wide shadow, skips the ORing all loaded 4/8-byte shadow byte
+part and the ORing all shadow bytes part.
+
+At this point we have two kinds of shadow that could be loaded
+1) wide shadow (>= i8) for scalar ints
+2) legacy i8 shadows for array, vector and struct
+
+Originally in VisitLoadInst, it assumes all loaded shadow is folded into i8.
+However for array/struct, they need to have matching shadow shape (i8 in each
+scalar member) Therefore, expandFromPrimitiveShadow was always called (which
+ignores scalar and vector) in the original version.
+
+For filling in wide shadows as elements of array/struct, expandFromPrimitiveShadow
+actually must be able to transform 1byte shadow into wide shadow. 
+In VisitLoadInst, scalar int data receives wide shadow directly from loadShadowFast, 
+and it is not necessary to call expandFromPrimitiveShadow, so early return is added.
+
+Because instructions like ADD are not bit-wise and carry/borrow could happen such
+that taint at byte 0 affects taint at byte 7, in combineShadows we shall collapse
+the wide scalar taint into 1 byte and OR them. Since collapseToPrimitiveShadow is
+called unconditionally in combineShadows, enabling collapseToPrimitiveShadow to fold
+also wide scalar taint will accomplish the goal.
+```
+  // unconditional call to collapse in combineShadows
+  Value *PV1 = collapseToPrimitiveShadow(V1, Pos);
+  Value *PV2 = collapseToPrimitiveShadow(V2, Pos);
+```
+
+The aftermath of enabling collapseToPrimitiveShadow to act on scalar wide shadow
+is that, we could no longer unconditionally call collapseToPrimitiveShadow in
+visitStoreInst. Previously, visitStoreInst folds whatever shadow it has and
+storePrimitiveShadowOrigin would find out the way to splat the 1 byte shadow
+to all shadow bytes of the data. Now we shall not call collapseToPrimitiveShadow
+to scalar shadows that are wide, and just let storePrimitiveShadowOrigin to
+store the wide shadow as is. The rest are folded scalar shadows or wide shadows
+of array/struct and should be folded to 1 byte and splatted as the legacy way.

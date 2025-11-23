@@ -60,6 +60,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Instrumentation/DataFlowSanitizer.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
@@ -100,6 +101,7 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SpecialCaseList.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -635,7 +637,7 @@ struct DFSanFunction {
   /// current stack if the returned shadow is tainted.
   std::pair<Value *, Value *> loadShadowOrigin(Value *Addr, uint64_t Size,
                                                Align InstAlignment,
-                                               Instruction *Pos);
+                                               Instruction *Pos, Type *ShadowTy);
 
   void storePrimitiveShadowOrigin(Value *Addr, uint64_t Size,
                                   Align InstAlignment, Value *PrimitiveShadow,
@@ -684,7 +686,7 @@ private:
   std::pair<Value *, Value *>
   loadShadowFast(Value *ShadowAddr, Value *OriginAddr, uint64_t Size,
                  Align ShadowAlign, Align OriginAlign, Value *FirstOrigin,
-                 Instruction *Pos);
+                 Instruction *Pos, Type *ShadowTy);
 
   Align getOriginAlign(Align InstAlignment);
 
@@ -734,7 +736,7 @@ private:
   /// shadow always has primitive type.
   std::pair<Value *, Value *>
   loadShadowOriginSansLoadTracking(Value *Addr, uint64_t Size,
-                                   Align InstAlignment, Instruction *Pos);
+                                   Align InstAlignment, Instruction *Pos, Type *ShadowTy);
   int NumOriginStores = 0;
 };
 
@@ -864,10 +866,17 @@ bool DataFlowSanitizer::shouldTrackOrigins() {
 }
 
 Constant *DataFlowSanitizer::getZeroShadow(Type *OrigTy) {
-  if (!isa<ArrayType>(OrigTy) && !isa<StructType>(OrigTy))
-    return ZeroPrimitiveShadow;
+  // the fix here is due to broken abilist.ll test
   Type *ShadowTy = getShadowTy(OrigTy);
-  return ConstantAggregateZero::get(ShadowTy);
+  // for ints
+  if (isa<IntegerType>(ShadowTy))
+    return ConstantInt::get(ShadowTy, 0);
+
+  // for aggregates
+  if (isa<ArrayType>(ShadowTy) || isa<StructType>(ShadowTy))
+    return ConstantAggregateZero::get(ShadowTy);
+
+  return ZeroPrimitiveShadow; // vectors i assume
 }
 
 Constant *DataFlowSanitizer::getZeroShadow(Value *V) {
@@ -877,6 +886,21 @@ Constant *DataFlowSanitizer::getZeroShadow(Value *V) {
 static Value *expandFromPrimitiveShadowRecursive(
     Value *Shadow, SmallVector<unsigned, 4> &Indices, Type *SubShadowTy,
     Value *PrimitiveShadow, IRBuilder<> &IRB) {
+
+  // we dont intend to touch this part but
+  // bc getshadowty now returns wide shadow but we still
+  // try to tuck an i8 shadow into for example i32 shadow
+  if (IntegerType *IT = dyn_cast<IntegerType>(SubShadowTy)) {
+    if (IT->getBitWidth() > 8) {
+      Value *Wide = IRB.CreateZExt(PrimitiveShadow, IT);
+      APInt One(8, 1);
+      APInt SplatConst = APInt::getSplat(IT->getBitWidth(), One);
+      Value *Expanded = IRB.CreateMul(Wide, ConstantInt::get(IT, SplatConst));
+      return IRB.CreateInsertValue(Shadow, Expanded, Indices);
+    }
+    llvm_unreachable("target shadow type should not be smaller than primitive shadow");
+  }
+
   if (!isa<ArrayType>(SubShadowTy) && !isa<StructType>(SubShadowTy))
     return IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
 
@@ -907,24 +931,59 @@ bool DFSanFunction::shouldInstrumentWithCall() {
          NumOriginStores >= ClInstrumentWithCallThreshold;
 }
 
-Value *DFSanFunction::expandFromPrimitiveShadow(Type *T, Value *PrimitiveShadow,
+Value *DFSanFunction::expandFromPrimitiveShadow(Type *T, Value *InputShadow,
                                                 Instruction *Pos) {
-  Type *ShadowTy = DFS.getShadowTy(T);
+  Type *TargetShadowTy = DFS.getShadowTy(T);
+  if (TargetShadowTy == InputShadow->getType())
+    return InputShadow;
 
-  if (!isa<ArrayType>(ShadowTy) && !isa<StructType>(ShadowTy))
-    return PrimitiveShadow;
+  if (IntegerType *DestIT = dyn_cast<IntegerType>(TargetShadowTy)) {
+    if (DestIT->getBitWidth() > DFS.ShadowWidthBits) {
+      IRBuilder<> IRB(Pos);
+      IntegerType *SrcIT = cast<IntegerType>(InputShadow->getType());
+      unsigned SrcWidth = SrcIT->getBitWidth();
+      unsigned DestWidth = DestIT->getBitWidth();
 
-  if (DFS.isZeroShadow(PrimitiveShadow))
-    return DFS.getZeroShadow(ShadowTy);
+      // If the input shadow is already a wide integer, fold it first
+      if (InputShadow->getType()->isIntegerTy() &&
+          InputShadow->getType()->getIntegerBitWidth() > DFS.ShadowWidthBits) {
+        // return IRB.CreateIntCast(InputShadow, IT, false);
+        InputShadow = collapseToPrimitiveShadow(InputShadow, IRB);
+        SrcIT = cast<IntegerType>(InputShadow->getType());
+        SrcWidth = SrcIT->getBitWidth();
+      }
+      if (SrcWidth == DestWidth) {
+        return InputShadow;
+      }
+
+      Value *Wide = IRB.CreateZExt(InputShadow, DestIT);
+      
+      // splat this 8-bit shadow to the destination width
+      // e.g. 0xAB -> 0xABABABAB
+      APInt SplatConst = APInt::getZero(DestWidth);
+      for (unsigned i = 0; i < DestWidth; i += 8) {
+          SplatConst |= APInt(DestWidth, 1).shl(i);
+      }
+      return IRB.CreateMul(Wide, ConstantInt::get(DestIT, SplatConst));
+    } 
+    // should panic 
+    llvm_unreachable("Destination shadow should not be smaller than primitive shadow");
+  }
+
+  if (!isa<ArrayType>(TargetShadowTy) && !isa<StructType>(TargetShadowTy))
+    return InputShadow;
+
+  if (DFS.isZeroShadow(InputShadow))
+    return DFS.getZeroShadow(TargetShadowTy);
 
   IRBuilder<> IRB(Pos);
   SmallVector<unsigned, 4> Indices;
-  Value *Shadow = UndefValue::get(ShadowTy);
-  Shadow = expandFromPrimitiveShadowRecursive(Shadow, Indices, ShadowTy,
-                                              PrimitiveShadow, IRB);
+  Value *Shadow = UndefValue::get(TargetShadowTy);
+  Shadow = expandFromPrimitiveShadowRecursive(Shadow, Indices, TargetShadowTy,
+                                              InputShadow, IRB);
 
   // Caches the primitive shadow value that built the shadow value.
-  CachedCollapsedShadows[Shadow] = PrimitiveShadow;
+  CachedCollapsedShadows[Shadow] = InputShadow;
   return Shadow;
 }
 
@@ -948,6 +1007,20 @@ Value *DFSanFunction::collapseAggregateShadow(AggregateType *AT, Value *Shadow,
 Value *DFSanFunction::collapseToPrimitiveShadow(Value *Shadow,
                                                 IRBuilder<> &IRB) {
   Type *ShadowTy = Shadow->getType();
+  
+  if (IntegerType *IT = dyn_cast<IntegerType>(ShadowTy)) {
+    if (IT->getBitWidth() > DFS.ShadowWidthBits) {
+      Value *Accumulator = Shadow;
+      for (unsigned Shift = IT->getBitWidth() / 2; Shift >= DFS.ShadowWidthBits;
+           Shift /= 2) {
+        Value *Shifted = IRB.CreateLShr(Accumulator, Shift);
+        Accumulator = IRB.CreateOr(Accumulator, Shifted);
+      }
+      return IRB.CreateTrunc(Accumulator, DFS.PrimitiveShadowTy);
+    }
+    return Shadow;
+  }
+
   if (!isa<ArrayType>(ShadowTy) && !isa<StructType>(ShadowTy))
     return Shadow;
   if (ArrayType *AT = dyn_cast<ArrayType>(ShadowTy))
@@ -960,7 +1033,10 @@ Value *DFSanFunction::collapseToPrimitiveShadow(Value *Shadow,
 Value *DFSanFunction::collapseToPrimitiveShadow(Value *Shadow,
                                                 Instruction *Pos) {
   Type *ShadowTy = Shadow->getType();
-  if (!isa<ArrayType>(ShadowTy) && !isa<StructType>(ShadowTy))
+
+  bool isWideInt = isa<IntegerType>(ShadowTy) &&
+                   cast<IntegerType>(ShadowTy)->getBitWidth() > DFS.ShadowWidthBits;
+  if (!isa<ArrayType>(ShadowTy) && !isa<StructType>(ShadowTy) && !isWideInt)
     return Shadow;
 
   // Checks if the cached collapsed shadow value dominates Pos.
@@ -994,8 +1070,17 @@ void DFSanFunction::addConditionalCallbacksIfEnabled(Instruction &I,
 Type *DataFlowSanitizer::getShadowTy(Type *OrigTy) {
   if (!OrigTy->isSized())
     return PrimitiveShadowTy;
-  if (isa<IntegerType>(OrigTy))
-    return PrimitiveShadowTy;
+  if (IntegerType *IT = dyn_cast<IntegerType>(OrigTy)) {
+    // return PrimitiveShadowTy;
+    
+    unsigned BitWidth = IT->getBitWidth();
+    if (BitWidth <= ShadowWidthBits) {
+      // return i8 for types smaller or eq to i8
+      return PrimitiveShadowTy;
+    }
+    return IntegerType::get(*Ctx, BitWidth); 
+  }  
+
   if (isa<VectorType>(OrigTy))
     return PrimitiveShadowTy;
   if (ArrayType *AT = dyn_cast<ArrayType>(OrigTy))
@@ -1842,40 +1927,85 @@ Value *DFSanFunction::combineOperandShadows(Instruction *Inst) {
     return DFS.getZeroShadow(Inst);
   }
 
-  // the choice to move this here instead of placing it in combineShadows
-  // is because i am not sure if the Pos parameter is always at the
-  // instruction being instrumented.
-  IRBuilder<> IRB(Inst);
+  bool IsBitWiseOperation = false;
+  bool shouldWashTaint = false;
   if (auto *BO = dyn_cast<BinaryOperator>(Inst)) {
-    // the bug was due to here we are not checking if it is scalar
-    // this previously captures also vector type but applies treatment
-    // for scalars and this could be verified by
-    // /home/ruida/code/phantom-trails-private/llvm/_build/bin/opt -dfsan -S 
-    // -disable-output /home/ruida/code/phantom-trails-private/llvm/llvm/test/Instrumentation/DataFlowSanitizer/vector.ll
-    if (BO->getOpcode() == Instruction::And && BO->getType()->isIntegerTy()) {
-      Value *Op1 = BO->getOperand(0);
-      Value *Op2 = BO->getOperand(1);
-      Value *PV1 = collapseToPrimitiveShadow(getShadow(Op1), Inst);
-      Value *PV2 = collapseToPrimitiveShadow(getShadow(Op2), Inst);
-
-      if (PV1->getType() != PV2->getType())
-        PV2 = IRB.CreateZExtOrTrunc(PV2, PV1->getType());
-      
-      Value *Op2isZero  = IRB.CreateICmpEQ(Op2, ConstantInt::get(Op2->getType(), 0));
-      Value *PV2isZero  = IRB.CreateICmpEQ(PV2, ConstantInt::get(PV2->getType(), 0));
-      // Sign ext the 1-bit mask
-      // NOT ZEXT 
-      Value *Mask1      = IRB.CreateSExt(IRB.CreateNot(IRB.CreateAnd(Op2isZero, PV2isZero)), PV1->getType());
-      
-      Value *PV1_new    = IRB.CreateAnd(PV1, Mask1);
-      Value *Op1isZero  = IRB.CreateICmpEQ(Op1, ConstantInt::get(Op1->getType(), 0));
-      Value *PV1isZero  = IRB.CreateICmpEQ(PV1, ConstantInt::get(PV1->getType(), 0));
-      Value *Mask2      = IRB.CreateSExt(IRB.CreateNot(IRB.CreateAnd(Op1isZero, PV1isZero)), PV2->getType());
-      
-      Value *PV2_new    = IRB.CreateAnd(PV2, Mask2);
-      Value *Result = IRB.CreateOr(PV1_new, PV2_new);
-      return expandFromPrimitiveShadow(Inst->getType(), Result, Inst);
+    // at least i8 is qualified for this special case
+    // since smaller ints are not 
+    if (BO->getType()->isIntegerTy() && DFS.getShadowTy(BO->getType()) == BO->getType()) {
+      switch (BO->getOpcode()) {
+      case Instruction::Or:
+        IsBitWiseOperation = true;
+        break;
+      case Instruction::And:
+        IsBitWiseOperation = true;
+        shouldWashTaint = true;
+        break;
+      default:
+        break;
+      }
     }
+  }
+
+  // // the choice to move this here instead of placing it in combineShadows
+  // // is because i am not sure if the Pos parameter is always at the
+  // // instruction being instrumented.
+  IRBuilder<> IRB(Inst);
+
+  if (IsBitWiseOperation) {
+    auto *BO = cast<BinaryOperator>(Inst);
+    Value *Op1 = BO->getOperand(0);
+    Value *Op2 = BO->getOperand(1);
+    Value *PV1;
+    Value *PV2;
+    if (IsBitWiseOperation) {
+      PV1 = getShadow(Op1);
+      PV2 = getShadow(Op2);
+    } else {
+      PV1 = collapseToPrimitiveShadow(getShadow(Op1), Inst);
+      PV2 = collapseToPrimitiveShadow(getShadow(Op2), Inst);
+    }
+
+    if (PV1->getType() != PV2->getType())
+      PV2 = IRB.CreateZExtOrTrunc(PV2, PV1->getType());
+
+    if (shouldWashTaint) {
+      Value *Mask1;
+      Value *Mask2;
+
+      auto CreateByteMask = [&](Value *Op, Value *Shadow) {
+        Value *Or = IRB.CreateOr(Op, Shadow);
+        unsigned BitWidth = Or->getType()->getIntegerBitWidth();
+        if (BitWidth <= 8) {
+          Value *Cmp = IRB.CreateICmpNE(Or, ConstantInt::get(Or->getType(), 0));
+          return IRB.CreateSExt(Cmp, Shadow->getType());
+        }
+        // gives 0x80 if byte value is non-zero, else 0x00
+        APInt C7F = APInt::getSplat(BitWidth, APInt(8, 0x7F));
+        APInt C80 = APInt::getSplat(BitWidth, APInt(8, 0x80));
+        Value *VC7F = ConstantInt::get(Or->getType(), C7F);
+        Value *VC80 = ConstantInt::get(Or->getType(), C80);
+
+        Value *T1 = IRB.CreateAnd(Or, VC7F);
+        Value *T2 = IRB.CreateAdd(T1, VC7F);
+        Value *T3 = IRB.CreateOr(T2, Or);
+        Value *T4 = IRB.CreateAnd(T3, VC80);
+
+        // 0x10000000 -> 0x11000000 -> 0x11110000 -> 0x11111111
+        Value *M0 = IRB.CreateOr(T4, IRB.CreateLShr(T4, 1));
+        Value *M1 = IRB.CreateOr(M0, IRB.CreateLShr(M0, 2));
+        Value *Mask = IRB.CreateOr(M1, IRB.CreateLShr(M1, 4));
+        return Mask;
+      };
+
+      Mask1 = CreateByteMask(Op2, PV2);
+      Mask2 = CreateByteMask(Op1, PV1);
+
+      PV1 = IRB.CreateAnd(PV1, Mask1);
+      PV2 = IRB.CreateAnd(PV2, Mask2);
+    }
+    Value *Result = IRB.CreateOr(PV1, PV2);
+    return Result;
   }
 
   Value *Shadow = getShadow(Inst->getOperand(0));
@@ -1988,7 +2118,7 @@ Value *DataFlowSanitizer::loadNextOrigin(Instruction *Pos, Align OriginAlign,
 
 std::pair<Value *, Value *> DFSanFunction::loadShadowFast(
     Value *ShadowAddr, Value *OriginAddr, uint64_t Size, Align ShadowAlign,
-    Align OriginAlign, Value *FirstOrigin, Instruction *Pos) {
+    Align OriginAlign, Value *FirstOrigin, Instruction *Pos, Type *ShadowTy=nullptr) {
   const bool ShouldTrackOrigins = DFS.shouldTrackOrigins();
   const uint64_t ShadowSize = Size * DFS.ShadowWidthBytes;
 
@@ -1997,6 +2127,14 @@ std::pair<Value *, Value *> DFSanFunction::loadShadowFast(
   // Used for origin tracking.
   std::vector<Value *> Shadows;
   std::vector<Value *> Origins;
+
+  bool WantPrecision = false;
+  if (isa_and_nonnull<IntegerType>(ShadowTy)) {
+      if (ShadowTy->getIntegerBitWidth() > DFS.ShadowWidthBits) {
+          WantPrecision = true;
+      }
+  }
+
 
   // Load instructions in LLVM can have arbitrary byte sizes (e.g., 3, 12, 20)
   // but this function is only used in a subset of cases that make it possible
@@ -2016,6 +2154,11 @@ std::pair<Value *, Value *> DFSanFunction::loadShadowFast(
   Value *WideAddr = IRB.CreateBitCast(ShadowAddr, WideShadowTy->getPointerTo());
   Value *CombinedWideShadow =
       IRB.CreateAlignedLoad(WideShadowTy, WideAddr, ShadowAlign);
+
+  // pretend origin tracking does not exist for now
+  if (WantPrecision) {
+    return {CombinedWideShadow, ShouldTrackOrigins? DFS.ZeroOrigin : nullptr};
+  }
 
   unsigned WideShadowBitWidth = WideShadowTy->getIntegerBitWidth();
   const uint64_t BytesPerWideShadow = WideShadowBitWidth / DFS.ShadowWidthBits;
@@ -2075,7 +2218,7 @@ std::pair<Value *, Value *> DFSanFunction::loadShadowFast(
 }
 
 std::pair<Value *, Value *> DFSanFunction::loadShadowOriginSansLoadTracking(
-    Value *Addr, uint64_t Size, Align InstAlignment, Instruction *Pos) {
+    Value *Addr, uint64_t Size, Align InstAlignment, Instruction *Pos, Type *ShadowTy=nullptr) {
   const bool ShouldTrackOrigins = DFS.shouldTrackOrigins();
 
   // Non-escaped loads.
@@ -2164,7 +2307,7 @@ std::pair<Value *, Value *> DFSanFunction::loadShadowOriginSansLoadTracking(
 
   if (HasSizeForFastPath)
     return loadShadowFast(ShadowAddr, OriginAddr, Size, ShadowAlign,
-                          OriginAlign, Origin, Pos);
+                          OriginAlign, Origin, Pos, ShadowTy);
 
   IRBuilder<> IRB(Pos);
   CallInst *FallbackCall = IRB.CreateCall(
@@ -2176,10 +2319,11 @@ std::pair<Value *, Value *> DFSanFunction::loadShadowOriginSansLoadTracking(
 std::pair<Value *, Value *> DFSanFunction::loadShadowOrigin(Value *Addr,
                                                             uint64_t Size,
                                                             Align InstAlignment,
-                                                            Instruction *Pos) {
+                                                            Instruction *Pos,
+                                                            Type *ShadowTy=nullptr) {
   Value *PrimitiveShadow, *Origin;
   std::tie(PrimitiveShadow, Origin) =
-      loadShadowOriginSansLoadTracking(Addr, Size, InstAlignment, Pos);
+      loadShadowOriginSansLoadTracking(Addr, Size, InstAlignment, Pos, ShadowTy);
   if (DFS.shouldTrackOrigins()) {
     if (ClTrackOrigins == 2) {
       IRBuilder<> IRB(Pos);
@@ -2252,28 +2396,42 @@ void DFSanVisitor::visitLoadInst(LoadInst &LI) {
   std::vector<Value *> Shadows;
   std::vector<Value *> Origins;
   Value *PrimitiveShadow, *Origin;
+  Type *TargetShadowTy = DFSF.DFS.getShadowTy(&LI);
   std::tie(PrimitiveShadow, Origin) =
-      DFSF.loadShadowOrigin(LI.getPointerOperand(), Size, LI.getAlign(), Pos);
+      DFSF.loadShadowOrigin(LI.getPointerOperand(), Size, LI.getAlign(), Pos, 
+                           TargetShadowTy);
   const bool ShouldTrackOrigins = DFSF.DFS.shouldTrackOrigins();
   if (ShouldTrackOrigins) {
     Shadows.push_back(PrimitiveShadow);
     Origins.push_back(Origin);
   }
-  if (ClCombinePointerLabelsOnLoad ||
-      DFSF.isLookupTableConstant(
-          StripPointerGEPsAndCasts(LI.getPointerOperand()))) {
-    Value *PtrShadow = DFSF.getShadow(LI.getPointerOperand());
-    PrimitiveShadow = DFSF.combineShadows(PrimitiveShadow, PtrShadow, Pos);
-    if (ShouldTrackOrigins) {
-      Shadows.push_back(PtrShadow);
-      Origins.push_back(DFSF.getOrigin(LI.getPointerOperand()));
-    }
-  }
+
+  // if ptr is tainted then the loaded value is tainted
+  // this logic is not needed bc iirc we disabled this by flag
+  //
+  // if (ClCombinePointerLabelsOnLoad ||
+  //     DFSF.isLookupTableConstant(
+  //         StripPointerGEPsAndCasts(LI.getPointerOperand()))) {
+  //   Value *PtrShadow = DFSF.getShadow(LI.getPointerOperand());
+  //   PrimitiveShadow = DFSF.combineShadows(PrimitiveShadow, PtrShadow, Pos);
+  //   if (ShouldTrackOrigins) {
+  //     Shadows.push_back(PtrShadow);
+  //     Origins.push_back(DFSF.getOrigin(LI.getPointerOperand()));
+  //   }
+  // }
+  
   if (!DFSF.DFS.isZeroShadow(PrimitiveShadow))
     DFSF.NonZeroChecks.push_back(PrimitiveShadow);
 
-  Value *Shadow =
-      DFSF.expandFromPrimitiveShadow(LI.getType(), PrimitiveShadow, Pos);
+  // here if it is already the correct type
+  // (which is the case for scalar int, the shadow type returned is now
+  //  wide shadow, we should not call expand again)
+  Value *Shadow = PrimitiveShadow;
+      // DFSF.expandFromPrimitiveShadow(LI.getType(), PrimitiveShadow, Pos);
+  if (Shadow->getType() != DFSF.DFS.getShadowTy(&LI)) {
+    Shadow = DFSF.expandFromPrimitiveShadow(LI.getType(), PrimitiveShadow, Pos);
+  }
+
   DFSF.setShadow(&LI, Shadow);
 
   if (ShouldTrackOrigins) {
@@ -2436,19 +2594,35 @@ void DFSanFunction::storePrimitiveShadowOrigin(Value *Addr, uint64_t Size,
   std::tie(ShadowAddr, OriginAddr) =
       DFS.getShadowOriginAddress(Addr, InstAlignment, Pos);
 
+  Type *ShadowTy = PrimitiveShadow->getType();
+  uint64_t ShadowTypeSize = F->getParent()->getDataLayout().getTypeStoreSize(ShadowTy);
+
+  if (ShadowTypeSize == Size) {
+    Value *WidePtr = IRB.CreateBitCast(ShadowAddr, ShadowTy->getPointerTo());
+    IRB.CreateAlignedStore(PrimitiveShadow, WidePtr, ShadowAlign);
+    // assume origin tracking does not exist for now
+    return;
+  }
+
   const unsigned ShadowVecSize = 8;
   assert(ShadowVecSize * DFS.ShadowWidthBits <= 128 &&
          "Shadow vector is too large!");
 
   uint64_t Offset = 0;
   uint64_t LeftSize = Size;
+
+  Value *ValToStore = PrimitiveShadow;
+  if (ValToStore->getType() != DFS.PrimitiveShadowTy) {
+    ValToStore = collapseToPrimitiveShadow(PrimitiveShadow, Pos);
+  }
+
   if (LeftSize >= ShadowVecSize) {
     auto *ShadowVecTy =
         FixedVectorType::get(DFS.PrimitiveShadowTy, ShadowVecSize);
     Value *ShadowVec = UndefValue::get(ShadowVecTy);
     for (unsigned I = 0; I != ShadowVecSize; ++I) {
       ShadowVec = IRB.CreateInsertElement(
-          ShadowVec, PrimitiveShadow,
+          ShadowVec, ValToStore,
           ConstantInt::get(Type::getInt32Ty(*DFS.Ctx), I));
     }
     Value *ShadowVecAddr =
@@ -2465,15 +2639,15 @@ void DFSanFunction::storePrimitiveShadowOrigin(Value *Addr, uint64_t Size,
   while (LeftSize > 0) {
     Value *CurShadowAddr =
         IRB.CreateConstGEP1_32(DFS.PrimitiveShadowTy, ShadowAddr, Offset);
-    IRB.CreateAlignedStore(PrimitiveShadow, CurShadowAddr, ShadowAlign);
+    IRB.CreateAlignedStore(ValToStore, CurShadowAddr, ShadowAlign);
     --LeftSize;
     ++Offset;
   }
 
-  if (ShouldTrackOrigins) {
-    storeOrigin(Pos, Addr, Size, PrimitiveShadow, Origin, OriginAddr,
-                InstAlignment);
-  }
+  // if (ShouldTrackOrigins) {
+  //   storeOrigin(Pos, Addr, Size, PrimitiveShadow, Origin, OriginAddr,
+  //               InstAlignment);
+  // }
 }
 
 static AtomicOrdering addReleaseOrdering(AtomicOrdering AO) {
@@ -2521,26 +2695,28 @@ void DFSanVisitor::visitStoreInst(StoreInst &SI) {
     Origins.push_back(DFSF.getOrigin(Val));
   }
 
-  Value *PrimitiveShadow;
-  if (ClCombinePointerLabelsOnStore) {
-    Value *PtrShadow = DFSF.getShadow(SI.getPointerOperand());
-    if (ShouldTrackOrigins) {
-      Shadows.push_back(PtrShadow);
-      Origins.push_back(DFSF.getOrigin(SI.getPointerOperand()));
-    }
-    PrimitiveShadow = DFSF.combineShadows(Shadow, PtrShadow, &SI);
-  } else {
-    PrimitiveShadow = DFSF.collapseToPrimitiveShadow(Shadow, &SI);
-  }
+  Value *ShadowToStore;
+  // if (ClCombinePointerLabelsOnStore) {
+  //   Value *PtrShadow = DFSF.getShadow(SI.getPointerOperand());
+  //   if (ShouldTrackOrigins) {
+  //     Shadows.push_back(PtrShadow);
+  //     Origins.push_back(DFSF.getOrigin(SI.getPointerOperand()));
+  //   }
+  //   ShadowToStore = DFSF.combineShadows(Shadow, PtrShadow, &SI);
+  // } else {
+    // ShadowToStore = DFSF.collapseToPrimitiveShadow(Shadow, &SI);
+  // }
+  ShadowToStore = Shadow;
+
   Value *Origin = nullptr;
   if (ShouldTrackOrigins)
     Origin = DFSF.combineOrigins(Shadows, Origins, &SI);
   DFSF.storePrimitiveShadowOrigin(SI.getPointerOperand(), Size, SI.getAlign(),
-                                  PrimitiveShadow, Origin, &SI);
+                                  ShadowToStore, Origin, &SI);
   if (ClEventCallbacks) {
     IRBuilder<> IRB(&SI);
     Value *Addr8 = IRB.CreateBitCast(SI.getPointerOperand(), DFSF.DFS.Int8Ptr);
-    IRB.CreateCall(DFSF.DFS.DFSanStoreCallbackFn, {PrimitiveShadow, Addr8});
+    IRB.CreateCall(DFSF.DFS.DFSanStoreCallbackFn, {ShadowToStore, Addr8});
   }
 }
 
@@ -2595,7 +2771,31 @@ void DFSanVisitor::visitBitCastInst(BitCastInst &BCI) {
   visitInstOperands(BCI);
 }
 
-void DFSanVisitor::visitCastInst(CastInst &CI) { visitInstOperands(CI); }
+void DFSanVisitor::visitCastInst(CastInst &CI) {
+  // there is a problem with trunc, if high 32 bits of u64 src is tainted
+  // u64 dst = (u32)src, the low 32 bits of dst is wrongly tainted
+  // this does not make sense and contributes to load word over-taint
+  if (CI.getOpcode() == Instruction::Trunc) {
+    Value *OpShadow = DFSF.getShadow(CI.getOperand(0));
+    Type *DestShadowTy = DFSF.DFS.getShadowTy(&CI);
+
+    // Only apply if we are downsizing integers (e.g. u64 -> u32)
+    if (OpShadow->getType()->isIntegerTy() && DestShadowTy->isIntegerTy() &&
+        OpShadow->getType()->getPrimitiveSizeInBits() >
+            DestShadowTy->getPrimitiveSizeInBits()) {
+      
+      IRBuilder<> IRB(&CI);
+      Value *TruncatedShadow = IRB.CreateTrunc(OpShadow, DestShadowTy);
+      DFSF.setShadow(&CI, TruncatedShadow);
+
+      // do not use visitInstOperand which collapse 8b shadow to 1b and apply to 4b
+
+      return;
+    }
+  }
+
+  visitInstOperands(CI);
+}
 
 void DFSanVisitor::visitCmpInst(CmpInst &CI) {
   visitInstOperands(CI);
@@ -2684,7 +2884,8 @@ void DFSanVisitor::visitAllocaInst(AllocaInst &I) {
   }
   if (AllLoadsStores) {
     IRBuilder<> IRB(&I);
-    DFSF.AllocaShadowMap[&I] = IRB.CreateAlloca(DFSF.DFS.PrimitiveShadowTy);
+    Type *ShadowTy = DFSF.DFS.getShadowTy(I.getAllocatedType());
+    DFSF.AllocaShadowMap[&I] = IRB.CreateAlloca(ShadowTy);
     if (DFSF.DFS.shouldTrackOrigins()) {
       DFSF.AllocaOriginMap[&I] =
           IRB.CreateAlloca(DFSF.DFS.OriginTy, nullptr, "_dfsa");
