@@ -1929,9 +1929,10 @@ Value *DFSanFunction::combineOperandShadows(Instruction *Inst) {
 
   bool IsBitWiseOperation = false;
   bool shouldWashTaint = false;
+  bool IsShiftOperation = false;
   if (auto *BO = dyn_cast<BinaryOperator>(Inst)) {
     // at least i8 is qualified for this special case
-    // since smaller ints are not 
+    // since smaller ints are not
     if (BO->getType()->isIntegerTy() && DFS.getShadowTy(BO->getType()) == BO->getType()) {
       switch (BO->getOpcode()) {
       case Instruction::Or:
@@ -1940,6 +1941,11 @@ Value *DFSanFunction::combineOperandShadows(Instruction *Inst) {
       case Instruction::And:
         IsBitWiseOperation = true;
         shouldWashTaint = true;
+        break;
+      case Instruction::Shl:
+      case Instruction::LShr:
+      case Instruction::AShr:
+        IsShiftOperation = true;
         break;
       default:
         break;
@@ -2005,6 +2011,86 @@ Value *DFSanFunction::combineOperandShadows(Instruction *Inst) {
       PV2 = IRB.CreateAnd(PV2, Mask2);
     }
     Value *Result = IRB.CreateOr(PV1, PV2);
+    return Result;
+  }
+
+  if (IsShiftOperation) {
+    // After the shift, each result byte is either "old" (contains at least 1
+    // bit from the original value) or "new" (all bits in the byte are zero-fill 
+    // or sign-extension).
+    //
+    // Combined shadow = OR of all shadow bytes from the original that survive
+    // into the result (not shifted out). Plus shift amount's shadow if tainted.
+    // 
+    // Old result bytes get the combined shadow splatted.
+    // New result bytes get 0 if the data byte is 0, otherwise combined shadow.
+    //
+    // Note that shift by 0 would not change the taint, not because of the impl,
+    // but at O3 it is optimized out so we won't get here.
+
+    auto *BO = cast<BinaryOperator>(Inst);
+    Value *DataOp = BO->getOperand(0);
+    Value *ShiftAmt = BO->getOperand(1);
+    Value *DataShadow = getShadow(DataOp);
+    Value *ShiftAmtShadow = getShadow(ShiftAmt);
+    unsigned BitWidth = BO->getType()->getIntegerBitWidth();
+    Type *Ty = BO->getType();
+
+    // Mask out shifted-out bytes from original shadow.
+    // Shadow is byte-granular: if ANY bit of a byte survives, we must keep
+    // that byte's entire label. So round the shift amount DOWN to byte
+    // boundary before computing the mask.
+    // For SHL by N: high bits of original are lost → keep low bytes.
+    // For LSHR/ASHR by N: low bits are lost → keep high bytes.
+    Value *BitWidthVal = ConstantInt::get(Ty, BitWidth);
+    Value *ClampedAmt = IRB.CreateSelect(
+        IRB.CreateICmpULT(ShiftAmt, BitWidthVal), ShiftAmt, BitWidthVal);
+    // Round down to byte boundary: N & ~7 = (N/8)*8
+    Value *ByteAlignedAmt = IRB.CreateAnd(ClampedAmt,
+                                          ConstantInt::get(Ty, ~7ULL));
+    Value *AllOnes = ConstantInt::get(Ty, APInt::getAllOnes(BitWidth));
+    Value *SurvivingMask;
+    if (BO->getOpcode() == Instruction::Shl) {
+      SurvivingMask = IRB.CreateLShr(AllOnes, ByteAlignedAmt);
+    } else {
+      SurvivingMask = IRB.CreateShl(AllOnes, ByteAlignedAmt);
+    }
+    Value *SurvivingShadow = IRB.CreateAnd(DataShadow, SurvivingMask);
+
+    // Collapse surviving shadow + shift amount taint into a single label byte.
+    Value *Combined = collapseToPrimitiveShadow(SurvivingShadow, IRB);
+    Value *ShiftTaint = collapseToPrimitiveShadow(ShiftAmtShadow, IRB);
+    Combined = IRB.CreateOr(Combined, ShiftTaint);
+
+    // Splat the combined label to full width.
+    Value *Splatted = expandFromPrimitiveShadow(BO->getType(), Combined, Inst);
+
+    // Mask out new byte positions in the result.
+    // SHL by N: bottom ⌊N/8⌋ bytes are new (zero-filled).
+    // LSHR by N: top ⌊N/8⌋ bytes are new (zero-filled).
+    // Round shift amount down to byte boundary.
+
+    // AND ~7 is equivalent to rounding down to the nearest multiple of 8
+    Value *NewByteBits = IRB.CreateAnd(ClampedAmt,
+                                       ConstantInt::get(Ty, ~7ULL));
+    NewByteBits = IRB.CreateSelect(
+        IRB.CreateICmpULT(NewByteBits, BitWidthVal), NewByteBits, BitWidthVal);
+    Value *ResultMask;
+    if (BO->getOpcode() == Instruction::Shl) {
+      ResultMask = IRB.CreateShl(AllOnes, NewByteBits);
+    } else {
+      ResultMask = IRB.CreateLShr(AllOnes, NewByteBits);
+    }
+
+    Value *Result = IRB.CreateAnd(Splatted, ResultMask);
+
+    // ASHR: sign-extended bytes get taint if source is negative.
+    if (BO->getOpcode() == Instruction::AShr) {
+      Value *IsNeg = IRB.CreateICmpSLT(DataOp,
+                                       ConstantInt::get(Ty, 0));
+      Result = IRB.CreateSelect(IsNeg, Splatted, Result);
+    }
+
     return Result;
   }
 
