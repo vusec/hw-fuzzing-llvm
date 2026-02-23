@@ -2226,7 +2226,8 @@ std::pair<Value *, Value *> DFSanFunction::loadShadowOriginSansLoadTracking(
     const auto SI = AllocaShadowMap.find(AI);
     if (SI != AllocaShadowMap.end()) {
       IRBuilder<> IRB(Pos);
-      Value *ShadowLI = IRB.CreateLoad(DFS.PrimitiveShadowTy, SI->second);
+      Type *AllocaShadowTy = cast<AllocaInst>(SI->second)->getAllocatedType();
+      Value *ShadowLI = IRB.CreateLoad(AllocaShadowTy, SI->second);
       const auto OI = AllocaOriginMap.find(AI);
       assert(!ShouldTrackOrigins || OI != AllocaOriginMap.end());
       return {ShadowLI, ShouldTrackOrigins
@@ -2294,6 +2295,21 @@ std::pair<Value *, Value *> DFSanFunction::loadShadowOriginSansLoadTracking(
   }
   case 2: {
     IRBuilder<> IRB(Pos);
+
+    bool WantPrecision = false;
+    if (isa_and_nonnull<IntegerType>(ShadowTy)) {
+      if (ShadowTy->getIntegerBitWidth() > DFS.ShadowWidthBits) {
+        WantPrecision = true;
+      }
+    }
+
+    if (WantPrecision) {
+      Value *WideAddr = IRB.CreateBitCast(ShadowAddr, ShadowTy->getPointerTo());
+      Value *WideShadow = IRB.CreateAlignedLoad(ShadowTy, WideAddr, ShadowAlign);
+      return {WideShadow, ShouldTrackOrigins ? DFS.ZeroOrigin : nullptr};
+    }
+
+    // Original path: combine two i8 shadow bytes
     Value *ShadowAddr1 = IRB.CreateGEP(DFS.PrimitiveShadowTy, ShadowAddr,
                                        ConstantInt::get(DFS.IntptrTy, 1));
     Value *Load =
@@ -2790,6 +2806,58 @@ void DFSanVisitor::visitCastInst(CastInst &CI) {
 
       // do not use visitInstOperand which collapse 8b shadow to 1b and apply to 4b
 
+      return;
+    }
+  }
+
+  // ZExt: zero-extend the shadow so only the original bytes remain tainted.
+  // The extended (high) bytes get zero shadow, preserving byte precision.
+  // The original shadow is kept as is.
+  if (CI.getOpcode() == Instruction::ZExt) {
+    Value *OpShadow = DFSF.getShadow(CI.getOperand(0));
+    Type *DestShadowTy = DFSF.DFS.getShadowTy(&CI);
+
+    if (OpShadow->getType()->isIntegerTy() && DestShadowTy->isIntegerTy() &&
+        OpShadow->getType()->getPrimitiveSizeInBits() <
+            DestShadowTy->getPrimitiveSizeInBits()) {
+
+      IRBuilder<> IRB(&CI);
+      Value *ExtendedShadow = IRB.CreateZExt(OpShadow, DestShadowTy);
+      DFSF.setShadow(&CI, ExtendedShadow);
+      return;
+    }
+  }
+
+  // SExt: runtime check on sign bit to decide shadow strategy.
+  // If positive (sign bit=0), behaves like ZExt: zero-extend shadow.
+  // If negative (sign bit=1), extended bytes depend on source: collapse (OR all shadow bytes) & expand.
+  if (CI.getOpcode() == Instruction::SExt) {
+    Value *OpShadow = DFSF.getShadow(CI.getOperand(0));
+    Type *DestShadowTy = DFSF.DFS.getShadowTy(&CI);
+
+    if (OpShadow->getType()->isIntegerTy() && DestShadowTy->isIntegerTy() &&
+        OpShadow->getType()->getPrimitiveSizeInBits() <
+            DestShadowTy->getPrimitiveSizeInBits()) {
+
+      IRBuilder<> IRB(&CI);
+
+      // Check sign bit of source value at runtime
+      Value *SrcVal = CI.getOperand(0);
+      Value *IsNegative = IRB.CreateICmpSLT(
+          SrcVal, ConstantInt::get(SrcVal->getType(), 0));
+
+      // Positive path: zero-extend shadow, upper bytes untainted
+      Value *ZExtShadow = IRB.CreateZExt(OpShadow, DestShadowTy);
+
+      // Negative path: collapse and expand to taint all bytes
+      Value *ExpandedShadow =
+          DFSF.expandFromPrimitiveShadow(CI.getType(), OpShadow, &CI);
+
+      // Select based on sign bit
+      Value *FinalShadow =
+          IRB.CreateSelect(IsNegative, ExpandedShadow, ZExtShadow);
+
+      DFSF.setShadow(&CI, FinalShadow);
       return;
     }
   }
