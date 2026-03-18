@@ -2123,6 +2123,102 @@ Value *DFSanFunction::combineOperandShadows(Instruction *Inst) {
     return Result;
   }
 
+  // Byte-precise handling for funnel shifts (llvm.fshl / llvm.fshr).
+  // fshl(a, b, n) = (a << n) | (b >> (BitWidth - n))
+  // fshr(a, b, n) = (a << (BitWidth - n)) | (b >> n)
+  if (auto *II = dyn_cast<IntrinsicInst>(Inst)) {
+    Intrinsic::ID IID = II->getIntrinsicID();
+    if ((IID == Intrinsic::fshl || IID == Intrinsic::fshr) &&
+        II->getType()->isIntegerTy() &&
+        DFS.getShadowTy(II->getType()) == II->getType()) {
+      bool IsFSHL = (IID == Intrinsic::fshl);
+      Value *HiOp = II->getArgOperand(0);
+      Value *LoOp = II->getArgOperand(1);
+      Value *ShiftAmt = II->getArgOperand(2);
+      Value *HiShadow = getShadow(HiOp);
+      Value *LoShadow = getShadow(LoOp);
+      Value *ShiftAmtShadow = getShadow(ShiftAmt);
+      unsigned BitWidth = II->getType()->getIntegerBitWidth();
+      Type *Ty = II->getType();
+      Value *BitWidthVal = ConstantInt::get(Ty, BitWidth);
+
+      // LLVM defines funnel shift amount as modulo BitWidth.
+      Value *ModAmt = IRB.CreateURem(ShiftAmt, BitWidthVal);
+      Value *ComplementAmt = IRB.CreateSub(BitWidthVal, ModAmt);
+
+      // Determine the effective shift amounts for each half.
+      // fshl: left half = a << ModAmt, right half = b >> ComplementAmt
+      // fshr: left half = a << ComplementAmt, right half = b >> ModAmt
+      Value *ShlAmt = IsFSHL ? ModAmt : ComplementAmt;
+      Value *LShrAmt = IsFSHL ? ComplementAmt : ModAmt;
+
+      // Compute byte-precise shadow for one shift half.
+      // When Amt >= BitWidth (i.e. ComplementAmt when ModAmt == 0), all bits
+      // are shifted out so the result is zero. We clamp Amt to 0 in that case
+      // to avoid poison from overshifts, then select 0 at the end.
+      auto ComputeShiftShadow = [&](Value *DataShadow, Value *Amt,
+                                    bool IsShl) -> Value * {
+        Value *IsOvershift = IRB.CreateICmpUGE(Amt, BitWidthVal);
+        Value *SafeAmt =
+            IRB.CreateSelect(IsOvershift, ConstantInt::get(Ty, 0), Amt);
+
+        Value *ByteAlignedAmt =
+            IRB.CreateAnd(SafeAmt, ConstantInt::get(Ty, ~7ULL));
+        Value *AllOnes = ConstantInt::get(Ty, APInt::getAllOnes(BitWidth));
+        Value *SurvivingMask;
+        if (IsShl) {
+          SurvivingMask = IRB.CreateLShr(AllOnes, ByteAlignedAmt);
+        } else {
+          SurvivingMask = IRB.CreateShl(AllOnes, ByteAlignedAmt);
+        }
+        Value *SurvivingShadow = IRB.CreateAnd(DataShadow, SurvivingMask);
+
+        Value *Combined = collapseToPrimitiveShadow(SurvivingShadow, IRB);
+        Value *ShiftTaint = collapseToPrimitiveShadow(ShiftAmtShadow, IRB);
+        Combined = IRB.CreateOr(Combined, ShiftTaint);
+        Value *Splatted = expandFromPrimitiveShadow(Ty, Combined, Inst);
+
+        // Per-byte taint mask: which result bytes got bits from tainted source
+        // bytes?
+        auto CreateByteMask = [&](Value *V) -> Value * {
+          if (BitWidth <= 8) {
+            Value *Cmp = IRB.CreateICmpNE(V, ConstantInt::get(Ty, 0));
+            return IRB.CreateSExt(Cmp, Ty);
+          }
+          APInt C7F = APInt::getSplat(BitWidth, APInt(8, 0x7F));
+          APInt C80 = APInt::getSplat(BitWidth, APInt(8, 0x80));
+          Value *VC7F = ConstantInt::get(Ty, C7F);
+          Value *VC80 = ConstantInt::get(Ty, C80);
+          Value *T1 = IRB.CreateAnd(V, VC7F);
+          Value *T2 = IRB.CreateAdd(T1, VC7F);
+          Value *T3 = IRB.CreateOr(T2, V);
+          Value *T4 = IRB.CreateAnd(T3, VC80);
+          Value *M0 = IRB.CreateOr(T4, IRB.CreateLShr(T4, 1));
+          Value *M1 = IRB.CreateOr(M0, IRB.CreateLShr(M0, 2));
+          return IRB.CreateOr(M1, IRB.CreateLShr(M1, 4));
+        };
+
+        Value *OrigTaintMask = CreateByteMask(DataShadow);
+        Value *ShiftedTaintMask;
+        if (IsShl) {
+          ShiftedTaintMask = IRB.CreateShl(OrigTaintMask, SafeAmt);
+        } else {
+          ShiftedTaintMask = IRB.CreateLShr(OrigTaintMask, SafeAmt);
+        }
+        Value *TaintMask = CreateByteMask(ShiftedTaintMask);
+        Value *Result = IRB.CreateAnd(Splatted, TaintMask);
+
+        return IRB.CreateSelect(IsOvershift, ConstantInt::get(Ty, 0), Result);
+      };
+
+      Value *ShlResult = ComputeShiftShadow(HiShadow, ShlAmt, /*IsShl=*/true);
+      Value *LShrResult =
+          ComputeShiftShadow(LoShadow, LShrAmt, /*IsShl=*/false);
+
+      return IRB.CreateOr(ShlResult, LShrResult);
+    }
+  }
+
   Value *Shadow = getShadow(Inst->getOperand(0));
   for (unsigned I = 1, N = Inst->getNumOperands(); I < N; ++I)
     Shadow = combineShadows(Shadow, getShadow(Inst->getOperand(I)), Inst);
