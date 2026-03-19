@@ -3077,6 +3077,63 @@ void DFSanVisitor::visitCastInst(CastInst &CI) {
 }
 
 void DFSanVisitor::visitCmpInst(CmpInst &CI) {
+  if (auto *ICI = dyn_cast<ICmpInst>(&CI)) {
+    // Equality comparisons (== / !=): wash taint completely.
+    // The comparison fully "consumes" the tainted value.
+    if (ICI->isEquality()) {
+      DFSF.setShadow(&CI, DFSF.DFS.getZeroShadow(&CI));
+      if (DFSF.DFS.shouldTrackOrigins())
+        DFSF.setOrigin(&CI, DFSF.DFS.ZeroOrigin);
+      return;
+    }
+
+    // Sign-bit tests (x < 0, x >= 0, x <= -1, x > -1):
+    // Only the highest byte matters, so propagate just that byte's shadow.
+    if (ICI->isSigned()) {
+      Constant *ConstOp = nullptr;
+      Value *Op = nullptr;
+      CmpInst::Predicate Pred;
+      if ((ConstOp = dyn_cast<Constant>(ICI->getOperand(1)))) {
+        Op = ICI->getOperand(0);
+        Pred = ICI->getPredicate();
+      } else if ((ConstOp = dyn_cast<Constant>(ICI->getOperand(0)))) {
+        Op = ICI->getOperand(1);
+        Pred = ICI->getSwappedPredicate();
+      }
+
+      if (ConstOp && Op) {
+        bool IsSignBitTest =
+            (ConstOp->isNullValue() &&
+             (Pred == CmpInst::ICMP_SLT || Pred == CmpInst::ICMP_SGE)) ||
+            (ConstOp->isAllOnesValue() &&
+             (Pred == CmpInst::ICMP_SGT || Pred == CmpInst::ICMP_SLE));
+
+        if (IsSignBitTest) {
+          Value *OpShadow = DFSF.getShadow(Op);
+          Type *ShadowTy = OpShadow->getType();
+
+          if (ShadowTy->isIntegerTy() &&
+              ShadowTy->getPrimitiveSizeInBits() > DFSF.DFS.ShadowWidthBits) {
+            // Extract the highest byte of the shadow (the sign-byte).
+            IRBuilder<> IRB(&CI);
+            unsigned BitWidth = ShadowTy->getPrimitiveSizeInBits();
+            Value *HighByte = IRB.CreateLShr(
+                OpShadow,
+                ConstantInt::get(ShadowTy, BitWidth - DFSF.DFS.ShadowWidthBits));
+            Value *Truncated =
+                IRB.CreateTrunc(HighByte, DFSF.DFS.PrimitiveShadowTy);
+            DFSF.setShadow(&CI, Truncated);
+            if (DFSF.DFS.shouldTrackOrigins())
+              DFSF.setOrigin(&CI, DFSF.getOrigin(Op));
+            return;
+          }
+          // For single-byte values, fall through to default handling.
+        }
+      }
+    }
+  }
+
+  // Default: combine all operand shadows (OR).
   visitInstOperands(CI);
   if (ClEventCallbacks) {
     IRBuilder<> IRB(&CI);
